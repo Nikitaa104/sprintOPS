@@ -1,0 +1,511 @@
+name: SprintOPS Scheduled Operations
+
+'on':
+  schedule:
+    # 04:00 UTC = 09:30 AM IST (Monday through Friday) -> Daily Standup Brief
+    - cron: '0 4 * * 1-5'
+    # 12:30 UTC = 06:00 PM IST (Monday through Friday) -> Daily Progress Pulse
+    - cron: '30 12 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Report-only workflow mode (standup-brief or progress-pulse)'
+        required: true
+        default: 'standup-brief'
+        type: choice
+        options:
+          - standup-brief
+          - progress-pulse
+      board_id:
+        description: 'Jira Board ID override (optional)'
+        required: false
+        type: string
+      sprint_id:
+        description: 'Jira Sprint ID override (optional)'
+        required: false
+        type: string
+      extra_instructions:
+        description: 'Additional operator instructions for this run (optional)'
+        required: false
+        type: string
+
+concurrency:
+  group: sprintops-scheduled
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sprintops-report:
+    name: Run SprintOPS Scheduled Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Enforce repository privacy gate
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          set -euo pipefail
+          echo "Repository privacy status: is_private=$IS_PRIVATE"
+
+          if [ "$IS_PRIVATE" != "true" ]; then
+            echo "::error::CRITICAL PRIVACY GATE TRIGGERED: Repository Nikitaa104/sprintOPS is currently PUBLIC."
+            echo "SprintOPS processes real Jira issues, team assignments, and internal sprint blockers."
+            echo "To protect your team's confidential data, execution is blocked while the repository is public."
+            echo "Action required: Go to Repository Settings -> General -> Danger Zone -> Change repository visibility -> Make private."
+            exit 1
+          fi
+          echo "[OK] Repository is private. Proceeding with SprintOPS operational pipeline."
+
+      - name: Make automation scripts executable
+        run: chmod +x automation/*.sh
+
+      - name: Determine operational mode (fail-closed)
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SELECTED_MODE="$INPUT_MODE"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            if [ "$SCHEDULE_CRON" = "0 4 * * 1-5" ]; then
+              SELECTED_MODE="standup-brief"
+            elif [ "$SCHEDULE_CRON" = "30 12 * * 1-5" ]; then
+              SELECTED_MODE="progress-pulse"
+            else
+              echo "::error::Unrecognized cron schedule '$SCHEDULE_CRON'. Terminating execution."
+              exit 1
+            fi
+          else
+            echo "::error::Unsupported event trigger '$EVENT_NAME'. Terminating execution."
+            exit 1
+          fi
+
+          # Hard-enforce that only report-only modes can execute in this workflow
+          case "$SELECTED_MODE" in
+            standup-brief|progress-pulse)
+              echo "SELECTED_MODE=$SELECTED_MODE" >> "$GITHUB_ENV"
+              echo "Authorized operational mode: $SELECTED_MODE"
+              ;;
+            *)
+              echo "::error::Unauthorized mode '$SELECTED_MODE'. Only 'standup-brief' and 'progress-pulse' are permitted."
+              exit 1
+              ;;
+          esac
+
+      - name: Validate required repository secrets
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_USERNAME: ${{ secrets.JIRA_USERNAME }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SPRINTOPS_TEAM_MAP_YAML: ${{ secrets.SPRINTOPS_TEAM_MAP_YAML }}
+        run: |
+          set -euo pipefail
+          MISSING=0
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::Missing secret OPENAI_API_KEY. Required for Codex model execution."
+            MISSING=1
+          fi
+          if [ -z "$JIRA_URL" ]; then
+            echo "::error::Missing secret JIRA_URL. Required for Jira connection."
+            MISSING=1
+          fi
+          if [ -z "$JIRA_USERNAME" ]; then
+            echo "::error::Missing secret JIRA_USERNAME. Required for Jira authentication."
+            MISSING=1
+          fi
+          if [ -z "$JIRA_API_TOKEN" ]; then
+            echo "::error::Missing secret JIRA_API_TOKEN. Required for Jira authentication."
+            MISSING=1
+          fi
+          if [ -z "$SPRINTOPS_TEAM_MAP_YAML" ]; then
+            echo "::error::Missing secret SPRINTOPS_TEAM_MAP_YAML. Real team configuration is mandatory for operational runs."
+            MISSING=1
+          fi
+
+          if [ "$MISSING" -eq 1 ]; then
+            echo "Required secrets are not fully configured. Please configure them under Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install --upgrade pip pyyaml uv "mcp-atlassian==0.24.6"
+
+      - name: Verify Jira API authentication (read-only)
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_USERNAME: ${{ secrets.JIRA_USERNAME }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          python3 -c "
+          import urllib.request
+          import urllib.error
+          import base64
+          import os
+          import sys
+
+          jira_url = os.environ.get('JIRA_URL', '').rstrip('/')
+          user = os.environ.get('JIRA_USERNAME', '').strip()
+          token = os.environ.get('JIRA_API_TOKEN', '').strip()
+
+          endpoint = f'{jira_url}/rest/api/3/myself'
+          auth_str = f'{user}:{token}'
+          b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('ascii')
+
+          req = urllib.request.Request(
+              endpoint,
+              headers={
+                  'Authorization': f'Basic {b64_auth}',
+                  'Accept': 'application/json',
+                  'User-Agent': 'SprintOPS-Verification/1.0'
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  if resp.status == 200:
+                      print('[OK] Jira API authentication verified successfully via /rest/api/3/myself (status 200).')
+                  else:
+                      print(f'::error::Unexpected Jira response status: {resp.status}')
+                      sys.exit(1)
+          except urllib.error.HTTPError as err:
+              if err.code in (401, 403):
+                  print('::error::Jira authentication failed. Please verify JIRA_USERNAME and JIRA_API_TOKEN.')
+              else:
+                  print(f'::error::Jira API returned HTTP {err.code}: {err.reason}')
+              sys.exit(1)
+          except Exception as exc:
+              print(f'::error::Could not connect to Jira instance at {jira_url}: {type(exc).__name__}')
+              sys.exit(1)
+          "
+
+      - name: Configure and validate Team Map
+        env:
+          SPRINTOPS_TEAM_MAP_YAML: ${{ secrets.SPRINTOPS_TEAM_MAP_YAML }}
+        run: |
+          python3 -c "
+          import os
+          import yaml
+          import sys
+
+          raw_yaml = os.environ.get('SPRINTOPS_TEAM_MAP_YAML', '')
+          if not raw_yaml.strip():
+              print('::error::SPRINTOPS_TEAM_MAP_YAML secret is empty.')
+              sys.exit(1)
+
+          try:
+              data = yaml.safe_load(raw_yaml)
+          except Exception as exc:
+              print(f'::error::Invalid YAML syntax in SPRINTOPS_TEAM_MAP_YAML: {exc}')
+              sys.exit(1)
+
+          if not isinstance(data, dict):
+              print('::error::Team map YAML root must be a mapping (dictionary).')
+              sys.exit(1)
+
+          # Validate board section
+          board = data.get('board')
+          if not isinstance(board, dict):
+              print('::error::Team map must contain a \"board\" section.')
+              sys.exit(1)
+          if not str(board.get('id', '')).strip():
+              print('::error::Team map \"board.id\" must be specified.')
+              sys.exit(1)
+          project_keys = board.get('project_keys')
+          if not isinstance(project_keys, list) or len(project_keys) == 0:
+              print('::error::Team map \"board.project_keys\" must be a non-empty list.')
+              sys.exit(1)
+
+          # Validate team section
+          team = data.get('team')
+          if not isinstance(team, list) or len(team) == 0:
+              print('::error::Team map must define a non-empty \"team\" list.')
+              sys.exit(1)
+          for idx, member in enumerate(team):
+              if not isinstance(member, dict):
+                  print(f'::error::Team member entry #{idx+1} must be a dictionary.')
+                  sys.exit(1)
+              if not member.get('name') or not member.get('jira_assignee'):
+                  print(f'::error::Team member entry #{idx+1} must define \"name\" and \"jira_assignee\".')
+                  sys.exit(1)
+
+          # Validate approval section if present
+          approval = data.get('approval')
+          if approval is not None:
+              if not isinstance(approval, dict):
+                  print('::error::Team map \"approval\" section must be a dictionary.')
+                  sys.exit(1)
+              authorities = approval.get('assigning_authorities', [])
+              if not isinstance(authorities, list):
+                  print('::error::\"approval.assigning_authorities\" must be a list.')
+                  sys.exit(1)
+
+          # Write validated configuration to disk
+          target_path = 'references/team-map.local.yaml'
+          with open(target_path, 'w', encoding='utf-8') as f:
+              f.write(raw_yaml)
+
+          print(f'[OK] Team map validated successfully (Board ID: {board.get(\"id\")}, {len(team)} team members configured).')
+          "
+          chmod 600 references/team-map.local.yaml
+
+      - name: Set up Python helper environment
+        run: |
+          python3 -m venv ../.venv-jira-tools
+          ../.venv-jira-tools/bin/pip install --upgrade pip pyyaml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Configure Atlassian Jira MCP Server with proper TOML escaping and read-only mode
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_USERNAME: ${{ secrets.JIRA_USERNAME }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          mkdir -p ~/.codex
+          python3 -c "
+          import os
+          import json
+          import tomllib
+          import sys
+
+          url = os.environ.get('JIRA_URL', '')
+          user = os.environ.get('JIRA_USERNAME', '')
+          token = os.environ.get('JIRA_API_TOKEN', '')
+
+          # Strictly enforce read-only operations at the MCP server level
+          config_content = (
+              '[mcp_servers.mcp-atlassian]\n'
+              'command = \"uvx\"\n'
+              'args = [\"--from\", \"mcp-atlassian==0.24.6\", \"mcp-atlassian\", \"--read-only\"]\n\n'
+              '[mcp_servers.mcp-atlassian.env]\n'
+              f'JIRA_URL = {json.dumps(url)}\n'
+              f'JIRA_USERNAME = {json.dumps(user)}\n'
+              f'JIRA_API_TOKEN = {json.dumps(token)}\n'
+              'READ_ONLY_MODE = \"true\"\n'
+          )
+
+          config_path = os.path.expanduser('~/.codex/config.toml')
+          with open(config_path, 'w', encoding='utf-8') as f:
+              f.write(config_content)
+
+          # Validate generated TOML using tomllib
+          with open(config_path, 'rb') as f:
+              parsed = tomllib.load(f)
+
+          server_cfg = parsed.get('mcp_servers', {}).get('mcp-atlassian', {})
+          args = server_cfg.get('args', [])
+          env_cfg = server_cfg.get('env', {})
+
+          if '--read-only' not in args or env_cfg.get('READ_ONLY_MODE') != 'true' or 'mcp-atlassian==0.24.6' not in args:
+              print('::error::Generated Codex config.toml failed read-only enforcement validation.')
+              sys.exit(1)
+
+          print('[OK] Generated ~/.codex/config.toml validated with tomllib: server-side read-only mode strictly enforced.')
+          "
+          chmod 600 ~/.codex/config.toml
+
+      - name: Validate Atlassian MCP Handshake & Tool Discovery
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_USERNAME: ${{ secrets.JIRA_USERNAME }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          echo "Checking Codex MCP registration..."
+          codex mcp list
+
+          echo "Running full asynchronous MCP protocol handshake with non-blocking timeout and read-only enforcement..."
+          python3 -c "
+          import asyncio
+          import json
+          import os
+          import sys
+
+          async def run_mcp_handshake():
+              env = os.environ.copy()
+              env['READ_ONLY_MODE'] = 'true'
+              proc = await asyncio.create_subprocess_exec(
+                  'uvx', '--from', 'mcp-atlassian==0.24.6', 'mcp-atlassian', '--read-only',
+                  stdin=asyncio.subprocess.PIPE,
+                  stdout=asyncio.subprocess.PIPE,
+                  stderr=asyncio.subprocess.DEVNULL,
+                  env=env
+              )
+
+              async def send_msg(payload):
+                  proc.stdin.write(json.dumps(payload).encode('utf-8') + b'\n')
+                  await proc.stdin.drain()
+
+              async def read_resp(step_name, timeout_sec=20):
+                  try:
+                      line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout_sec)
+                  except asyncio.TimeoutError:
+                      print(f'::error::Timeout waiting for MCP {step_name} response ({timeout_sec}s exceeded).')
+                      sys.exit(1)
+                  if not line:
+                      print(f'::error::MCP server process closed stream during {step_name}.')
+                      sys.exit(1)
+                  return json.loads(line.decode('utf-8'))
+
+              try:
+                  # Step 1: Send initialize request
+                  await send_msg({
+                      'jsonrpc': '2.0',
+                      'id': 1,
+                      'method': 'initialize',
+                      'params': {
+                          'protocolVersion': '2024-11-05',
+                          'capabilities': {},
+                          'clientInfo': {'name': 'sprintops-healthcheck', 'version': '1.0.0'}
+                      }
+                  })
+                  init_resp = await read_resp('initialize')
+                  if 'error' in init_resp:
+                      print(f'::error::MCP initialize error: {init_resp[\"error\"]}')
+                      sys.exit(1)
+                  if 'result' not in init_resp:
+                      print(f'::error::MCP initialize response missing result: {init_resp}')
+                      sys.exit(1)
+
+                  # Step 2: Send initialized notification
+                  await send_msg({
+                      'jsonrpc': '2.0',
+                      'method': 'notifications/initialized'
+                  })
+
+                  # Step 3: Send tools/list request
+                  await send_msg({
+                      'jsonrpc': '2.0',
+                      'id': 2,
+                      'method': 'tools/list',
+                      'params': {}
+                  })
+                  tools_resp = await read_resp('tools/list')
+
+                  if 'error' in tools_resp:
+                      print(f'::error::MCP tools/list returned error: {tools_resp[\"error\"]}')
+                      sys.exit(1)
+
+                  tools = tools_resp.get('result', {}).get('tools', [])
+                  if not isinstance(tools, list) or len(tools) == 0:
+                      print('::error::MCP server returned empty or invalid tool list. Failing closed.')
+                      sys.exit(1)
+
+                  tool_names = [t.get('name', '') for t in tools if isinstance(t, dict)]
+
+                  # Enforce read-only tool verification: reject any write or mutation tools
+                  write_patterns = [
+                      'create', 'update', 'delete', 'transition',
+                      'assign', 'modify', 'edit', 'remove', 'add_comment', 'write'
+                  ]
+                  write_tools = [n for n in tool_names if any(p in n.lower() for p in write_patterns)]
+                  if write_tools:
+                      print(f'::error::READ-ONLY VIOLATION: Discovered mutation-capable tools in read-only mode: {write_tools}. Failing closed.')
+                      sys.exit(1)
+
+                  print(f'[OK] Complete MCP initialization handshake completed. Verified {len(tool_names)} strictly read-only tools: {tool_names}')
+
+              finally:
+                  if proc.returncode is None:
+                      try:
+                          proc.terminate()
+                          await asyncio.wait_for(proc.wait(), timeout=3)
+                      except Exception:
+                          try:
+                              proc.kill()
+                              await asyncio.wait_for(proc.wait(), timeout=2)
+                          except Exception:
+                              pass
+
+          try:
+              asyncio.run(asyncio.wait_for(run_mcp_handshake(), timeout=25))
+          except asyncio.TimeoutError:
+              print('::error::Total MCP handshake sequence exceeded 25-second timeout.')
+              sys.exit(1)
+          "
+
+      - name: Install SprintOPS Skill into Codex
+        run: ./automation/sprintops-install-skill.sh
+
+      - name: Execute SprintOPS Workflow
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BOARD_ID_INPUT: ${{ github.event.inputs.board_id }}
+          SPRINT_ID_INPUT: ${{ github.event.inputs.sprint_id }}
+          EXTRA_INPUT: ${{ github.event.inputs.extra_instructions }}
+        run: |
+          set -euo pipefail
+
+          ARGS=()
+          if [ -n "$BOARD_ID_INPUT" ]; then
+            ARGS+=(--board-id "$BOARD_ID_INPUT")
+          fi
+          if [ -n "$SPRINT_ID_INPUT" ]; then
+            ARGS+=(--sprint-id "$SPRINT_ID_INPUT")
+          fi
+          if [ -n "$EXTRA_INPUT" ]; then
+            ARGS+=(--extra "$EXTRA_INPUT")
+          fi
+
+          echo "Executing SprintOPS in mode: $SELECTED_MODE (strictly report-only, zero mutations allowed)"
+          if [ "$SELECTED_MODE" = "standup-brief" ]; then
+            ./automation/sprintops-standup-brief.sh "${ARGS[@]}"
+          elif [ "$SELECTED_MODE" = "progress-pulse" ]; then
+            ./automation/sprintops-progress-pulse.sh "${ARGS[@]}"
+          else
+            echo "::error::Unsupported mode: $SELECTED_MODE"
+            exit 1
+          fi
+
+      - name: Publish Confidentiality Notice to Job Summary
+        if: always()
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          REPORT_FILE=$(find automation/output -maxdepth 1 -name "${SELECTED_MODE}-*.md" 2>/dev/null | sort | tail -n 1)
+          STATUS_TEXT="${{ job.status == 'success' && 'Completed successfully' || (job.status == 'failure' && 'Failed' || 'Cancelled') }}"
+          echo "## 🛡️ SprintOPS $SELECTED_MODE Execution Receipt" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** $STATUS_TEXT" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mode:** \`$SELECTED_MODE\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp (UTC):** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$REPORT_FILE" ] && [ -f "$REPORT_FILE" ]; then
+            FILE_SIZE=$(wc -c < "$REPORT_FILE" | tr -d ' ')
+            echo "- **Generated Report:** \`$(basename "$REPORT_FILE")\` ($FILE_SIZE bytes)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "$IS_PRIVATE" != "true" ]; then
+            echo "> ⚠️ **Confidentiality Notice:** Because this repository is public, internal Jira issue summaries, employee names, and sprint blocker details have been omitted from this public summary to protect team confidentiality." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "> 🔒 **Private Repository Notice:** Sprint report generated securely within private repository environment. Downloadable via job artifacts." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Report Artifacts (Restricted retention)
+        if: always() && github.event.repository.private == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprintops-${{ env.SELECTED_MODE }}-${{ github.run_id }}
+          path: automation/output/*.md
+          retention-days: 14
+          if-no-files-found: warn
