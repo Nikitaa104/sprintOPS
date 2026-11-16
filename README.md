@@ -2,9 +2,6 @@
 
 > **AI-Powered Sprint Orchestration & Operations**  
 > *Agentic Jira Automation & Sprint Management System*
-
-Developed by **Coder Coder** | 🚀 Find more projects at [CodinzHub Projects](https://www.codinzhub.com/projects)
-
 ---
 
 ## 📋 Overview
@@ -156,5 +153,3 @@ Sample cron patterns are provided in [`automation/cron.example`](automation/cron
 - **Secret Protection**: `team-map.local.yaml`, `.env`, and audit output files are git-ignored to prevent credential leaks.
 
 ---
-
-*Created by **Coder Coder** | [CodinzHub Projects](https://www.codinzhub.com/projects)*
