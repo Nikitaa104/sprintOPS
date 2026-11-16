@@ -1,0 +1,44 @@
+# Environments
+.venv/
+.venv*/
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Local SprintOPS Configuration (Contains sensitive board IDs, assignee emails, and tokens)
+references/*.local.yaml
+*.local.yaml
+
+# Automation run logs and outputs
+automation/output/*
+!automation/output/.gitkeep
+*.log
+
+# Sensitive environment files
+.env
+.env.*
+!.env.example
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
